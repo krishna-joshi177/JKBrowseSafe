@@ -20,6 +20,10 @@ jobs:
       - name: Create platform folders
         run: flutter create --platforms=android --org com.safebrowse .
       - run: flutter pub get
+      - name: Add INTERNET permission
+        run: |
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          grep -n "permission" android/app/src/main/AndroidManifest.xml
       - name: Patch inappwebview ProGuard setting
         run: |
           for f in $HOME/.pub-cache/hosted/pub.dev/flutter_inappwebview_android-*/android/build.gradle; do

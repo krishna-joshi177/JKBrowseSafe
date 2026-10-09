@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -20,6 +20,12 @@ jobs:
       - name: Create platform folders
         run: flutter create --platforms=android --org com.safebrowse .
       - run: flutter pub get
+      - name: Patch inappwebview ProGuard setting
+        run: |
+          for f in $HOME/.pub-cache/hosted/pub.dev/flutter_inappwebview_android-*/android/build.gradle; do
+            sed -i "s/proguard-android.txt/proguard-android-optimize.txt/g" "$f"
+            echo "Patched $f"
+          done
       - name: Build APK
         run: flutter build apk --release
       - uses: actions/upload-artifact@v4
@@ -37,7 +43,14 @@ jobs:
       - name: Create platform folders
         run: flutter create --platforms=windows --org com.safebrowse .
       - run: flutter pub get
+      - name: Silence coroutine deprecation error
+        shell: bash
+        run: |
+          sed -i '/^project(/a add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)' windows/CMakeLists.txt
+          grep -n "SILENCE" windows/CMakeLists.txt
       - name: Build Windows app
+        env:
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: flutter build windows --release
       - uses: actions/upload-artifact@v4
         with:

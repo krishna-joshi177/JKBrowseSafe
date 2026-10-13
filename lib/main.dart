@@ -8,6 +8,7 @@ import 'src/browser_page.dart';
 import 'src/constants.dart';
 import 'src/crash_reporter.dart';
 import 'src/download_manager.dart';
+import 'src/threat_lists.dart';
 
 void main() {
   runZonedGuarded<Future<void>>(() async {
@@ -23,6 +24,8 @@ void main() {
     };
     final state = await AppState.load();
     final downloads = DownloadManager(state);
+    await ThreatLists.instance.init();
+    unawaited(ThreatLists.instance.updateIfStale());
     runApp(JKBrowseSafeApp(state: state, downloads: downloads));
   }, (error, stack) => CrashReporter.record(error, stack));
 }

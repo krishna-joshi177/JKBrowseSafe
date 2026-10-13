@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../url_utils.dart';
 
-/// Friendly full-page error / offline / crash screen.
+/// Friendly full-page error / offline / crash / danger screen.
 class ErrorView extends StatelessWidget {
   const ErrorView({
     super.key,
@@ -36,8 +36,14 @@ class ErrorView extends StatelessWidget {
       case TabErrorKind.ssl:
         icon = Icons.gpp_bad_outlined;
         title = "Your connection isn't private";
-        message = "$host's security certificate isn't trusted. Someone might "
-            'be trying to steal your information, so the page was blocked.';
+        message = "$host's security certificate isn't valid or trusted. "
+            'Someone might be trying to steal your information, so '
+            'JKBrowseSafe blocked the page. This warning cannot be skipped.';
+      case TabErrorKind.dangerous:
+        icon = Icons.dangerous_outlined;
+        title = 'Dangerous site blocked';
+        message = '$host has been reported for phishing or malware. It may '
+            'try to steal your passwords or harm your device.';
       case TabErrorKind.crashed:
         icon = Icons.sentiment_dissatisfied_outlined;
         title = 'This page crashed';
@@ -53,11 +59,11 @@ class ErrorView extends StatelessWidget {
         title = "This site can't be reached";
         message = '$host might be down, or the address might be wrong.';
     }
-    final theme = Theme.of(context);
-    final isSsl = kind == TabErrorKind.ssl;
 
+    final theme = Theme.of(context);
+    final danger = kind == TabErrorKind.ssl || kind == TabErrorKind.dangerous;
     return Container(
-      color: theme.colorScheme.surface,
+      color: danger ? theme.colorScheme.errorContainer : theme.colorScheme.surface,
       child: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
@@ -69,7 +75,7 @@ class ErrorView extends StatelessWidget {
               children: [
                 Icon(icon,
                     size: 56,
-                    color: isSsl
+                    color: danger
                         ? theme.colorScheme.error
                         : theme.colorScheme.onSurfaceVariant,
                     semanticLabel: title),
@@ -85,7 +91,7 @@ class ErrorView extends StatelessWidget {
                 ],
                 const SizedBox(height: 24),
                 Wrap(spacing: 12, runSpacing: 8, children: [
-                  if (isSsl)
+                  if (danger)
                     FilledButton(
                         onPressed: onBack, child: const Text('Back to safety'))
                   else
@@ -93,13 +99,15 @@ class ErrorView extends StatelessWidget {
                         onPressed: onRetry,
                         icon: const Icon(Icons.refresh),
                         label: const Text('Try again')),
-                  if (!isSsl)
+                  if (!danger)
                     OutlinedButton(
                         onPressed: onBack, child: const Text('Go back')),
                   if (onContinueInsecure != null)
                     TextButton(
                         onPressed: onContinueInsecure,
-                        child: const Text('Continue to site (not secure)')),
+                        child: Text(kind == TabErrorKind.dangerous
+                            ? 'Ignore warning and visit (unsafe)'
+                            : 'Continue to site (not secure)')),
                 ]),
               ],
             ),

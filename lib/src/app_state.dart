@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'crash_reporter.dart';
 import 'models.dart';
+import 'security.dart';
 
 /// Settings, bookmarks, history, site permissions and saved tabs.
 class AppState extends ChangeNotifier {
@@ -22,6 +23,8 @@ class AppState extends ChangeNotifier {
   List<Bookmark> bookmarks = <Bookmark>[];
   List<HistoryEntry> history = <HistoryEntry>[];
   Map<String, Map<String, String>> sitePerms = <String, Map<String, String>>{};
+  Set<String> jsBlocked = <String>{};
+  Set<String> blockedSites = <String>{};
   String engineId = 'ddg';
   ThemeMode themeMode = ThemeMode.system;
   bool forceDarkPages = false;
@@ -47,6 +50,9 @@ class AppState extends ChangeNotifier {
             MapEntry(k, Map<String, String>.from(v as Map)));
       } catch (_) {}
     }
+    jsBlocked = (_p.getStringList('jsBlocked') ?? const <String>[]).toSet();
+    blockedSites =
+        (_p.getStringList('blockedSites') ?? const <String>[]).toSet();
     engineId = _p.getString('engine') ?? 'ddg';
     final theme = _p.getString('theme');
     themeMode = ThemeMode.values
@@ -173,6 +179,40 @@ class AppState extends ChangeNotifier {
 
   void _saveSitePerms() {
     _p.setString('sitePerms', jsonEncode(sitePerms));
+    notifyListeners();
+  }
+
+  // ---------------- Per-site JavaScript ----------------
+  /// JavaScript is allowed by default on every site.
+  bool jsEnabledFor(String host) =>
+      host.isEmpty || !jsBlocked.contains(host.toLowerCase());
+
+  void setJsEnabled(String host, bool enabled) {
+    final h = host.toLowerCase();
+    if (h.isEmpty) return;
+    if (enabled) {
+      jsBlocked.remove(h);
+    } else {
+      jsBlocked.add(h);
+    }
+    _p.setStringList('jsBlocked', jsBlocked.toList());
+    notifyListeners();
+  }
+
+  // ---------------- Sites blocked by the user ----------------
+  bool isUserBlocked(String host) => hostInSet(blockedSites, host);
+
+  void blockSite(String host) {
+    final h = host.toLowerCase();
+    if (h.isEmpty) return;
+    blockedSites.add(h);
+    _p.setStringList('blockedSites', blockedSites.toList());
+    notifyListeners();
+  }
+
+  void unblockSite(String host) {
+    blockedSites.remove(host.toLowerCase());
+    _p.setStringList('blockedSites', blockedSites.toList());
     notifyListeners();
   }
 

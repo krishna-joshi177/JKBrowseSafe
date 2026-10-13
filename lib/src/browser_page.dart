@@ -20,6 +20,8 @@ import 'pages/history_page.dart';
 import 'pages/settings_page.dart';
 import 'pages/site_settings_page.dart';
 import 'permissions.dart';
+import 'security.dart';
+import 'threat_lists.dart';
 import 'url_utils.dart';
 import 'widgets/error_view.dart';
 
@@ -34,9 +36,11 @@ class BrowserPage extends StatefulWidget {
 
 class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   AppState get s => widget.state;
+  ThreatLists get lists => ThreatLists.instance;
 
   final List<BrowserTab> _tabs = <BrowserTab>[];
   int _current = 0;
+
   final TextEditingController _address = TextEditingController();
   final FocusNode _addressFocus = FocusNode();
   final TextEditingController _findCtrl = TextEditingController();
@@ -44,7 +48,14 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   int _findCount = 0;
   DateTime? _lastBack;
   String? _defaultUserAgent;
+  bool _externalPromptOpen = false;
+  int _appliedListsVersion = -1;
+
+  /// Hosts the user chose to open over plain http (this session only).
   final Set<String> _httpAllowedHosts = <String>{};
+
+  /// Dangerous hosts the user chose to visit anyway (this session only).
+  final Set<String> _unsafeAllowedHosts = <String>{};
 
   BrowserTab get tab => _tabs[_current];
 
@@ -56,6 +67,8 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     s.addListener(_onStateChanged);
+    lists.addListener(_onListsChanged);
+    _appliedListsVersion = lists.version;
     for (final j in s.savedTabs) {
       final t = BrowserTab.fromJson(j);
       if (t.url.isNotEmpty) _tabs.add(t);
@@ -76,6 +89,7 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     s.removeListener(_onStateChanged);
+    lists.removeListener(_onListsChanged);
     _address.dispose();
     _addressFocus.dispose();
     _findCtrl.dispose();
@@ -85,10 +99,21 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) _persistTabs();
+    if (state == AppLifecycleState.resumed) {
+      unawaited(lists.updateIfStale());
+    }
   }
 
   void _onStateChanged() {
     if (mounted) setState(() {});
+  }
+
+  /// New tracker list downloaded: give every open tab the new blocker.
+  void _onListsChanged() {
+    if (lists.version != _appliedListsVersion) {
+      _appliedListsVersion = lists.version;
+      unawaited(_applySettingsToAllTabs());
+    }
   }
 
   void _onAddressFocus() {
@@ -156,6 +181,75 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   }
 
   // =====================================================================
+  // Safety checks
+  // =====================================================================
+
+  /// Phishing / malware lists, plus sites the user blocked.
+  bool _isDangerous(String url) {
+    final host = hostOf(url);
+    if (host.isEmpty || _unsafeAllowedHosts.contains(host)) return false;
+    return s.isUserBlocked(host) || lists.isThreat(url);
+  }
+
+  void _showDangerous(BrowserTab t, String url) {
+    if (!mounted) return;
+    final host = hostOf(url);
+    setState(() {
+      t.url = url;
+      t.failedUrl = url;
+      t.error = TabErrorKind.dangerous;
+      t.errorDetail = s.isUserBlocked(host)
+          ? 'You blocked this site. Unblock it in Settings > Blocked sites.'
+          : 'Source: public phishing and malware lists.';
+      t.progress = 1;
+    });
+    if (identical(t, tab)) _syncAddress();
+  }
+
+  void _continueUnsafe(BrowserTab t) {
+    final url = t.failedUrl ?? t.url;
+    final host = hostOf(url);
+    if (s.isUserBlocked(host)) s.unblockSite(host);
+    _unsafeAllowedHosts.add(host);
+    setState(() => t.error = TabErrorKind.none);
+    t.controller?.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+  }
+
+  /// When HTTPS-only is off, asks before opening an http:// page.
+  Future<bool> _confirmHttp(String url) async {
+    if (!url.toLowerCase().startsWith('http://')) return true;
+    final host = hostOf(url);
+    if (host.isEmpty ||
+        host == 'localhost' ||
+        host == '127.0.0.1' ||
+        _httpAllowedHosts.contains(host)) {
+      return true;
+    }
+    final ok = await _confirm(
+      'This site is not secure',
+      "$host doesn't use HTTPS. Passwords, card numbers and messages you "
+          'send can be seen or changed by others on the network.',
+      yes: 'Continue anyway',
+      no: 'Go back',
+      danger: true,
+    );
+    if (ok) _httpAllowedHosts.add(host);
+    return ok;
+  }
+
+  /// Turns JavaScript on/off for the tab to match the site's setting.
+  /// Returns true if the setting changed.
+  Future<bool> _syncJs(BrowserTab t, String url) async {
+    final want = s.jsEnabledFor(hostOf(url));
+    if (want == t.jsEnabled) return false;
+    t.jsEnabled = want;
+    try {
+      await t.controller?.setSettings(settings: _settingsFor(t));
+    } catch (_) {}
+    return true;
+  }
+
+  // =====================================================================
   // Navigation
   // =====================================================================
   void _go(String input) {
@@ -163,14 +257,21 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     _addressFocus.unfocus();
   }
 
-  void _load(BrowserTab t, String url) {
+  Future<void> _load(BrowserTab t, String url) async {
     final target = _upgradeUrl(t, url);
+    if (_isDangerous(target)) {
+      _showDangerous(t, target);
+      return;
+    }
+    if (!await _confirmHttp(target)) return;
+    await _syncJs(t, target);
+    if (!mounted) return;
     setState(() {
       t.error = TabErrorKind.none;
       t.url = target;
     });
     _syncAddress();
-    t.controller?.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
+    await t.controller?.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
   }
 
   void _reload() {
@@ -188,11 +289,23 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     final url = uri.toString();
     final scheme = uri.scheme.toLowerCase();
     final isMain = action.isForMainFrame;
+    final gesture = action.hasGesture;
 
-    // External apps: mailto:, tel:, intent:, market:, whatsapp:, upi: ...
+    // Other apps: mailto:, tel:, intent:, market:, whatsapp:, upi: ...
     const internal = <String>{'http', 'https', 'about', 'data', 'blob', 'javascript'};
     if (!internal.contains(scheme)) {
-      if (isMain) await _openExternal(url);
+      if (isMain) unawaited(_openExternal(url, userGesture: gesture != false));
+      return NavigationActionPolicy.CANCEL;
+    }
+
+    // Pages may not open hidden data: pages as a whole page (phishing trick).
+    if (isMain && scheme == 'data') {
+      _toast('Blocked a page that tried to open a hidden "data:" address');
+      return NavigationActionPolicy.CANCEL;
+    }
+
+    if (isMain && _isDangerous(url)) {
+      _showDangerous(t, url);
       return NavigationActionPolicy.CANCEL;
     }
 
@@ -200,12 +313,54 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
       return NavigationActionPolicy.CANCEL;
     }
 
-    if (isMain && scheme == 'http' && s.httpsOnly) {
-      final upgraded = _upgradeUrl(t, url);
-      if (upgraded != url) {
-        c.loadUrl(urlRequest: URLRequest(url: WebUri(upgraded)));
+    if (isMain && scheme == 'http') {
+      if (s.httpsOnly) {
+        final upgraded = _upgradeUrl(t, url);
+        if (upgraded != url) {
+          await _syncJs(t, upgraded);
+          await c.loadUrl(urlRequest: URLRequest(url: WebUri(upgraded)));
+          return NavigationActionPolicy.CANCEL;
+        }
+      } else if (!_httpAllowedHosts.contains(uri.host)) {
+        unawaited(_load(t, url)); // asks first
         return NavigationActionPolicy.CANCEL;
       }
+    }
+
+    // Automatic redirect chains: block the 3rd cross-site jump within
+    // 10 seconds that happened without a tap.
+    if (isMain && (scheme == 'http' || scheme == 'https')) {
+      if (gesture == true) {
+        t.autoNavs.clear();
+      } else if (gesture == false &&
+          action.isRedirect != true &&
+          t.url.startsWith('http')) {
+        final from = registrableDomain(hostOf(t.url));
+        final to = registrableDomain(uri.host);
+        if (from.isNotEmpty && to != from) {
+          final now = DateTime.now();
+          t.autoNavs.removeWhere(
+              (d) => now.difference(d) > const Duration(seconds: 10));
+          t.autoNavs.add(now);
+          if (t.autoNavs.length > 2) {
+            _toast('Blocked an automatic redirect to ${uri.host}',
+                action: SnackBarAction(
+                    label: 'Allow',
+                    onPressed: () {
+                      t.autoNavs.clear();
+                      _load(t, url);
+                    }));
+            return NavigationActionPolicy.CANCEL;
+          }
+        }
+      }
+    }
+
+    // Per-site JavaScript: switch the setting before the new site loads.
+    if (isMain && s.jsEnabledFor(uri.host) != t.jsEnabled) {
+      await _syncJs(t, url);
+      await c.loadUrl(urlRequest: URLRequest(url: uri));
+      return NavigationActionPolicy.CANCEL;
     }
 
     // Offer to open Play Store links in the Play Store app.
@@ -228,7 +383,20 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     return NavigationActionPolicy.ALLOW;
   }
 
-  Future<void> _openExternal(String url) async {
+  String _appLabel(String scheme) => switch (scheme) {
+        'mailto' => 'your email app',
+        'tel' => 'the phone dialer',
+        'sms' => 'your messages app',
+        'market' => 'the Google Play Store',
+        'upi' => 'a UPI payment app',
+        'whatsapp' => 'WhatsApp',
+        'tg' => 'Telegram',
+        _ => 'another app ("$scheme:" link)',
+      };
+
+  /// Always asks before leaving the browser for another app.
+  Future<void> _openExternal(String url, {bool userGesture = true}) async {
+    if (_externalPromptOpen) return;
     Uri? target = Uri.tryParse(url);
     if (url.startsWith('intent:')) {
       final fallback =
@@ -236,7 +404,7 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
       final pkg = RegExp(r'package=([^;]+)').firstMatch(url)?.group(1);
       if (fallback != null) {
         try {
-          _load(tab, Uri.decodeComponent(fallback));
+          await _load(tab, Uri.decodeComponent(fallback));
           return;
         } catch (_) {}
       }
@@ -244,13 +412,22 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     }
     if (target == null) return;
     final scheme = target.scheme.toLowerCase();
-    const trusted = <String>{'mailto', 'tel', 'sms', 'market'};
-    if (!trusted.contains(scheme)) {
-      final ok = await _confirm('Open in another app?',
-          'This page wants to open a "$scheme:" link in another app.',
-          yes: 'Open', no: 'Cancel');
-      if (!ok) return;
+    final site = hostOf(tab.url).isEmpty ? 'This page' : hostOf(tab.url);
+
+    if (!userGesture) {
+      _toast('Blocked $site from opening ${_appLabel(scheme)}',
+          action: SnackBarAction(
+              label: 'Allow', onPressed: () => _openExternal(url)));
+      return;
     }
+
+    _externalPromptOpen = true;
+    final ok = await _confirm('Open another app?',
+        '$site wants to open ${_appLabel(scheme)}.',
+        yes: 'Open', no: 'Cancel');
+    _externalPromptOpen = false;
+    if (!ok) return;
+
     var launched = false;
     try {
       launched =
@@ -259,7 +436,7 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     if (!launched && scheme == 'market') {
       final id = target.queryParameters['id'];
       if (id != null) {
-        _load(tab, 'https://play.google.com/store/apps/details?id=$id');
+        await _load(tab, 'https://play.google.com/store/apps/details?id=$id');
         return;
       }
     }
@@ -328,19 +505,29 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   // =====================================================================
   // WebView
   // =====================================================================
-  late final List<ContentBlocker> _blockers = trackerHosts
-      .map((d) => ContentBlocker(
-            trigger: ContentBlockerTrigger(
-                urlFilter:
-                    '^https?://([^/]*\\.)?${d.replaceAll('.', '\\.')}[/:?]'),
-            action: ContentBlockerAction(type: ContentBlockerActionType.BLOCK),
-          ))
-      .toList();
+  int _blockersVersion = -1;
+  List<ContentBlocker> _blockerCache = <ContentBlocker>[];
+
+  /// Built-in + downloaded tracker list, grouped into a few rules.
+  List<ContentBlocker> get _blockers {
+    if (_blockersVersion != lists.version) {
+      _blockersVersion = lists.version;
+      final domains = lists.trackerDomains.toList()..sort();
+      _blockerCache = buildTrackerPatterns(domains)
+          .map((p) => ContentBlocker(
+                trigger: ContentBlockerTrigger(urlFilter: p),
+                action:
+                    ContentBlockerAction(type: ContentBlockerActionType.BLOCK),
+              ))
+          .toList();
+    }
+    return _blockerCache;
+  }
 
   InAppWebViewSettings _settingsFor(BrowserTab t) => InAppWebViewSettings(
         incognito: t.incognito,
         cacheEnabled: !t.incognito,
-        javaScriptEnabled: true,
+        javaScriptEnabled: t.jsEnabled,
         javaScriptCanOpenWindowsAutomatically: false, // pop-up blocker
         supportMultipleWindows: true, // target=_blank opens a new tab
         useShouldOverrideUrlLoading: true,
@@ -355,6 +542,8 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
         builtInZoomControls: true,
         displayZoomControls: false,
         allowFileAccess: false,
+        allowFileAccessFromFileURLs: false,
+        allowUniversalAccessFromFileURLs: false,
         textZoom: s.textZoom,
         algorithmicDarkeningAllowed: s.forceDarkPages,
         userAgent: t.desktopMode ? kDesktopUserAgent : _defaultUserAgent,
@@ -376,23 +565,46 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
 
   Widget _tabView(BrowserTab t) {
     if (!t.activated) return const SizedBox.shrink();
+    if (t.controller == null) t.jsEnabled = s.jsEnabledFor(hostOf(t.url));
+    final startUrl = _upgradeUrl(t, t.url);
+    final startBlocked = t.windowId == null && _isDangerous(startUrl);
     return Stack(fit: StackFit.expand, children: [
       InAppWebView(
         key: t.key,
         windowId: t.windowId,
-        initialUrlRequest: t.windowId == null
-            ? URLRequest(url: WebUri(_upgradeUrl(t, t.url)))
+        initialUrlRequest: t.windowId == null && !startBlocked
+            ? URLRequest(url: WebUri(startUrl))
             : null,
         initialSettings: _settingsFor(t),
-        onWebViewCreated: (c) => t.controller = c,
-        onLoadStart: (c, url) {
+        onWebViewCreated: (c) {
+          t.controller = c;
+          if (startBlocked) {
+            WidgetsBinding.instance
+                .addPostFrameCallback((_) => _showDangerous(t, startUrl));
+          }
+        },
+        onLoadStart: (c, url) async {
           if (!mounted) return;
+          final u = url?.toString() ?? '';
+          // Backstop: also catches server redirects to dangerous sites.
+          if (u.isNotEmpty && _isDangerous(u)) {
+            try {
+              await c.stopLoading();
+            } catch (_) {}
+            _showDangerous(t, u);
+            return;
+          }
           setState(() {
-            if (url != null) t.url = url.toString();
+            if (u.isNotEmpty) t.url = u;
             t.progress = 0.05;
             if (t.error != TabErrorKind.crashed) t.error = TabErrorKind.none;
           });
           if (identical(t, tab)) _syncAddress();
+          if (u.isNotEmpty && await _syncJs(t, u)) {
+            try {
+              await c.reload();
+            } catch (_) {}
+          }
         },
         onLoadStop: (c, url) async {
           String? title;
@@ -433,6 +645,21 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
         onCreateWindow: (c, action) async {
           final url = action.request.url?.toString() ?? 'about:blank';
           if (s.blockTrackers && isTrackerUrl(url)) return false;
+          if (_isDangerous(url)) {
+            _toast('Blocked a pop-up to a dangerous site');
+            return false;
+          }
+          // Pop-up blocker: new windows need a real tap or click.
+          if (action.hasGesture == false) {
+            _toast('Pop-up blocked',
+                action: url.startsWith('http')
+                    ? SnackBarAction(
+                        label: 'Open',
+                        onPressed: () =>
+                            _newTab(url: url, incognito: t.incognito))
+                    : null);
+            return false;
+          }
           final nt = BrowserTab(
             url: url,
             incognito: t.incognito,
@@ -447,6 +674,11 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
           return true;
         },
         onCloseWindow: (c) => _closeTab(_tabs.indexOf(t)),
+        onEnterFullscreen: (c) {
+          // Full screen hides the real address bar, so say which site it is.
+          final host = hostOf(t.url).isEmpty ? 'This page' : hostOf(t.url);
+          _toast('$host is now full screen. Press Back or Esc to exit.');
+        },
         onDownloadStartRequest: (c, req) => _onDownload(t, req),
         onPermissionRequest: (c, req) => _onPermission(t, req),
         onGeolocationPermissionsShowPrompt: (c, origin) async {
@@ -456,13 +688,15 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
               origin: origin, allow: allow, retain: false);
         },
         onReceivedError: (c, req, err) => _onError(t, req, err),
+        // Invalid certificates are never ignored: the load is cancelled and
+        // a warning page is shown. There is no "proceed anyway" button.
         onReceivedServerTrustAuthRequest: (c, challenge) async {
           final host = challenge.protectionSpace.host;
           if (mounted && host == hostOf(t.url)) {
             setState(() {
               t.error = TabErrorKind.ssl;
               t.failedUrl = t.url;
-              t.errorDetail = '';
+              t.errorDetail = 'Certificate check failed for $host.';
               t.progress = 1;
             });
           }
@@ -489,9 +723,11 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
             detail: t.errorDetail,
             onRetry: () => _retry(t),
             onBack: () => _backFromError(t),
-            onContinueInsecure: t.error == TabErrorKind.httpsUnavailable
-                ? () => _continueInsecure(t)
-                : null,
+            onContinueInsecure: switch (t.error) {
+              TabErrorKind.httpsUnavailable => () => _continueInsecure(t),
+              TabErrorKind.dangerous => () => _continueUnsafe(t),
+              _ => null,
+            },
           ),
         ),
     ]);
@@ -503,11 +739,13 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   Future<void> _onError(
       BrowserTab t, WebResourceRequest req, WebResourceError err) async {
     if (req.isForMainFrame == false) return;
+    if (t.error == TabErrorKind.dangerous) return;
     final text = '${err.type} ${err.description}';
     if (isCancelledError(text)) return;
     var kind = classifyError(text);
     if (t.upgradedFrom != null &&
         kind != TabErrorKind.offline &&
+        kind != TabErrorKind.ssl &&
         hostOf(req.url.toString()) == hostOf(t.upgradedFrom!)) {
       kind = TabErrorKind.httpsUnavailable;
     }
@@ -526,6 +764,10 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
 
   void _retry(BrowserTab t) {
     final url = t.failedUrl ?? t.url;
+    if (_isDangerous(url)) {
+      _showDangerous(t, url);
+      return;
+    }
     setState(() => t.error = TabErrorKind.none);
     t.controller?.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
   }
@@ -536,7 +778,7 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     if (c != null && await c.canGoBack()) {
       await c.goBack();
     } else {
-      _load(t, s.engine.home);
+      await _load(t, s.engine.home);
     }
   }
 
@@ -563,14 +805,21 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     }
     final name =
         fileNameFor(url, r.suggestedFilename, r.contentDisposition, r.mimeType);
-    final dangerous = dangerousExtensions.contains(extensionOf(name));
-    final size = r.contentLength > 0 ? ' (${formatBytes(r.contentLength)})' : '';
     final host = hostOf(url).isEmpty ? 'this site' : hostOf(url);
+    final verdict = checkDownload(name, url,
+        fromDangerousSite: lists.isThreat(url) ||
+            lists.isThreat(t.url) ||
+            s.isUserBlocked(hostOf(url)));
+    if (verdict.risk == DownloadRisk.block) {
+      _toast('Blocked "$name" because ${verdict.reason}.');
+      return;
+    }
+    final dangerous = verdict.risk == DownloadRisk.warn;
+    final size = r.contentLength > 0 ? ' (${formatBytes(r.contentLength)})' : '';
     final ok = await _confirm(
       dangerous ? 'This file could harm your device' : 'Download file?',
       dangerous
-          ? '"$name" can install or run software. Only download it if you '
-              'trust $host.'
+          ? '"$name": ${verdict.reason}. Only download it if you trust $host.'
           : '$name$size',
       yes: dangerous ? 'Download anyway' : 'Download',
       danger: dangerous,
@@ -707,6 +956,10 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
       {bool backwards = false, bool reset = false}) async {
     final c = tab.controller;
     if (c == null) return;
+    if (!tab.jsEnabled) {
+      _toast('Find in page needs JavaScript, which is blocked on this site');
+      return;
+    }
     if (text.isEmpty) {
       await c.evaluateJavascript(
           source: 'window.getSelection && window.getSelection().removeAllRanges();');
@@ -735,13 +988,13 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
   Future<void> _openBookmarks() async {
     final url = await Navigator.push<String>(context,
         MaterialPageRoute<String>(builder: (_) => BookmarksPage(state: s)));
-    if (url != null) _load(tab, url);
+    if (url != null) await _load(tab, url);
   }
 
   Future<void> _openHistory() async {
     final url = await Navigator.push<String>(context,
         MaterialPageRoute<String>(builder: (_) => HistoryPage(state: s)));
-    if (url != null) _load(tab, url);
+    if (url != null) await _load(tab, url);
   }
 
   Future<void> _openDownloads() async {
@@ -764,6 +1017,9 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
         MaterialPageRoute<void>(
             builder: (_) =>
                 SettingsPage(state: s, downloads: widget.downloads)));
+    for (final t in _tabs) {
+      await _syncJs(t, t.url);
+    }
     await _applySettingsToAllTabs();
   }
 
@@ -789,45 +1045,154 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     _persistTabs();
   }
 
-  void _showPageInfo() {
+  /// Report the current site to public safety services, or block it here.
+  Future<void> _reportUnsafe() async {
     final t = tab;
-    final origin = originOf(t.url);
-    final host = hostOf(t.url).isEmpty ? t.url : hostOf(t.url);
-    showModalBottomSheet<void>(
+    final url = t.failedUrl != null && t.error == TabErrorKind.dangerous
+        ? t.failedUrl!
+        : t.url;
+    final host = hostOf(url);
+    if (host.isEmpty || !url.startsWith('http')) {
+      _toast('Open a website first');
+      return;
+    }
+    final enc = Uri.encodeComponent(url);
+    final choice = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           ListTile(
-            leading: Icon(t.secure ? Icons.lock : Icons.lock_open,
-                color: t.secure ? Colors.green : Colors.red),
-            title: Text(host, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle: Text(t.secure
-                ? 'Connection is secure'
-                : "Connection is not secure. Don't enter passwords or "
-                    'payment details on this site.'),
-          ),
-          const Divider(),
-          ListTile(
-            leading: const Icon(Icons.tune),
-            title: const Text('Permissions for this site'),
-            onTap: () {
-              Navigator.pop(ctx);
-              _openSiteSettings(origin);
-            },
+            title: const Text('Report unsafe site'),
+            subtitle: Text(host),
           ),
           ListTile(
-            leading: const Icon(Icons.cookie_outlined),
-            title: const Text('Delete cookies for this site'),
-            onTap: () async {
-              Navigator.pop(ctx);
-              try {
-                await CookieManager.instance().deleteCookies(url: WebUri(t.url));
-              } catch (_) {}
-              _toast('Cookies deleted for $host');
-            },
+            leading: const Icon(Icons.phishing),
+            title: const Text('Phishing or fake login page'),
+            subtitle: const Text('Report to Google Safe Browsing'),
+            onTap: () => Navigator.pop(ctx, 'phish'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.bug_report_outlined),
+            title: const Text('Malware or harmful download'),
+            subtitle: const Text('Report to Google Safe Browsing'),
+            onTap: () => Navigator.pop(ctx, 'malware'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.local_police_outlined),
+            title: const Text('Online fraud (India)'),
+            subtitle: const Text('National Cyber Crime Reporting Portal'),
+            onTap: () => Navigator.pop(ctx, 'india'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.block),
+            title: Text('Block $host on this device'),
+            onTap: () => Navigator.pop(ctx, 'block'),
           ),
         ]),
+      ),
+    );
+    switch (choice) {
+      case 'phish':
+        _newTab(
+            url: 'https://safebrowsing.google.com/safebrowsing/report_phish/?url=$enc',
+            incognito: t.incognito);
+      case 'malware':
+        _newTab(
+            url: 'https://safebrowsing.google.com/safebrowsing/report_badware/?url=$enc',
+            incognito: t.incognito);
+      case 'india':
+        _newTab(url: 'https://cybercrime.gov.in/', incognito: t.incognito);
+      case 'block':
+        s.blockSite(host);
+        _unsafeAllowedHosts.remove(host);
+        try {
+          await t.controller?.stopLoading();
+        } catch (_) {}
+        _showDangerous(t, url);
+        _toast('$host is blocked on this device',
+            action: SnackBarAction(
+                label: 'Undo', onPressed: () => s.unblockSite(host)));
+    }
+  }
+
+  void _showPageInfo() {
+    final t = tab;
+    final origin = originOf(t.url);
+    final host = hostOf(t.url).isEmpty ? t.url : hostOf(t.url);
+    final web = t.url.startsWith('http://') || t.url.startsWith('https://');
+    final warning = suspiciousReason(t.url);
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => SafeArea(
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              ListTile(
+                leading: Icon(t.secure ? Icons.lock : Icons.lock_open,
+                    color: t.secure ? Colors.green : Colors.red),
+                title: Text(host, maxLines: 2, overflow: TextOverflow.ellipsis),
+                subtitle: Text(t.secure
+                    ? 'Connection is secure'
+                    : "Connection is not secure. Don't enter passwords or "
+                        'payment details on this site.'),
+              ),
+              if (warning != null)
+                ListTile(
+                  leading: const Icon(Icons.gpp_maybe, color: Colors.red),
+                  title: const Text('Check this address carefully'),
+                  subtitle: Text(warning),
+                ),
+              const Divider(),
+              if (web)
+                SwitchListTile(
+                  secondary: const Icon(Icons.code),
+                  title: const Text('JavaScript'),
+                  subtitle: Text(s.jsEnabledFor(hostOf(t.url))
+                      ? 'Allowed on this site'
+                      : 'Blocked on this site (some pages may not work)'),
+                  value: s.jsEnabledFor(hostOf(t.url)),
+                  onChanged: (v) async {
+                    s.setJsEnabled(hostOf(t.url), v);
+                    setSheet(() {});
+                    if (await _syncJs(t, t.url)) {
+                      await t.controller?.reload();
+                    }
+                  },
+                ),
+              ListTile(
+                leading: const Icon(Icons.tune),
+                title: const Text('Permissions for this site'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _openSiteSettings(origin);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.cookie_outlined),
+                title: const Text('Delete cookies for this site'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await CookieManager.instance().deleteCookies(url: WebUri(t.url));
+                  } catch (_) {}
+                  _toast('Cookies deleted for $host');
+                },
+              ),
+              if (web)
+                ListTile(
+                  leading: const Icon(Icons.report_outlined),
+                  title: const Text('Report unsafe site'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _reportUnsafe();
+                  },
+                ),
+            ]),
+          ),
+        ),
       ),
     );
   }
@@ -852,6 +1217,8 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
         await _toggleDesktop();
       case 'site':
         await _openSiteSettings(originOf(tab.url));
+      case 'report':
+        await _reportUnsafe();
       case 'settings':
         await _openSettings();
     }
@@ -928,6 +1295,7 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
                 checked: tab.desktopMode,
                 child: const Text('Desktop site')),
           _item('site', Icons.tune, 'Site settings'),
+          _item('report', Icons.report_outlined, 'Report unsafe site'),
           const PopupMenuDivider(),
           _item('settings', Icons.settings_outlined, 'Settings'),
         ],
@@ -939,7 +1307,9 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     final lockIcon = t.incognito
         ? Icons.visibility_off
         : (t.secure ? Icons.lock : Icons.lock_open);
-    return TextField(
+    final fill =
+        t.incognito ? scheme.tertiaryContainer : scheme.surfaceContainerHighest;
+    final field = TextField(
       controller: _address,
       focusNode: _addressFocus,
       keyboardType: TextInputType.url,
@@ -951,12 +1321,12 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
       decoration: InputDecoration(
         isDense: true,
         filled: true,
-        fillColor: t.incognito
-            ? scheme.tertiaryContainer
-            : scheme.surfaceContainerHighest,
+        fillColor: fill,
         hintText: 'Search ${s.engine.name} or type a URL',
         prefixIcon: IconButton(
-          tooltip: t.secure ? 'Site information: secure' : 'Site information: not secure',
+          tooltip: t.secure
+              ? 'Site information: secure'
+              : 'Site information: not secure',
           icon: Icon(lockIcon,
               size: 18,
               color: t.incognito
@@ -980,6 +1350,28 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
         contentPadding: const EdgeInsets.symmetric(vertical: 10),
       ),
     );
+    final web = t.url.startsWith('http://') || t.url.startsWith('https://');
+    if (_addressFocus.hasFocus || !web) return field;
+    // When not editing, the app (never the web page) draws the real domain
+    // in bold so look-alike addresses are easy to spot.
+    return Stack(children: [
+      field,
+      Positioned(
+        left: 48,
+        right: 48,
+        top: 2,
+        bottom: 2,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => _addressFocus.requestFocus(),
+          child: Container(
+            color: fill,
+            alignment: Alignment.centerLeft,
+            child: _DomainLabel(url: t.url),
+          ),
+        ),
+      ),
+    ]);
   }
 
   Widget _tabCountButton(ColorScheme scheme) => IconButton(
@@ -1141,8 +1533,10 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
                         Icon(t.incognito ? Icons.visibility_off : Icons.public),
                     title: Text(t.title,
                         maxLines: 1, overflow: TextOverflow.ellipsis),
-                    subtitle: Text(t.url,
-                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    subtitle: Text(
+                        hostOf(t.url).isEmpty ? t.url : hostOf(t.url),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis),
                     trailing: IconButton(
                         tooltip: 'Close tab',
                         icon: const Icon(Icons.close),
@@ -1243,7 +1637,6 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
     // Tablets (>= 600 dp wide) and Windows get the desktop layout.
     final wide = MediaQuery.sizeOf(context).width >= 600;
     final scheme = Theme.of(context).colorScheme;
-
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
@@ -1303,6 +1696,67 @@ class _BrowserPageState extends State<BrowserPage> with WidgetsBindingObserver {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Shows the real site name: sub-domain dimmed, owner domain in bold,
+/// plus "Not secure" and a warning icon for look-alike addresses.
+class _DomainLabel extends StatelessWidget {
+  const _DomainLabel({required this.url});
+  final String url;
+
+  @override
+  Widget build(BuildContext context) {
+    final u = Uri.tryParse(url);
+    final host = u?.host ?? '';
+    final scheme = Theme.of(context).colorScheme;
+    final base = TextStyle(fontSize: 15, color: scheme.onSurface);
+    if (u == null || host.isEmpty) {
+      return Text(url, maxLines: 1, overflow: TextOverflow.ellipsis, style: base);
+    }
+    final main = registrableDomain(host);
+    final sub =
+        host.length > main.length ? host.substring(0, host.length - main.length) : '';
+    final risky = suspiciousReason(url) != null;
+    final insecure = u.scheme == 'http';
+    return Semantics(
+      label: '${insecure ? 'Not secure. ' : ''}'
+          '${risky ? 'Warning, check this address. ' : ''}'
+          'Site $host. Tap to edit the address.',
+      excludeSemantics: true,
+      child: Row(children: [
+        if (insecure)
+          Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: Text('Not secure',
+                style: base.copyWith(
+                    color: scheme.error, fontWeight: FontWeight.w600)),
+          ),
+        if (sub.isNotEmpty)
+          Flexible(
+            child: Text(sub,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textDirection: TextDirection.ltr,
+                style: base.copyWith(color: scheme.onSurfaceVariant)),
+          ),
+        Flexible(
+          flex: 4,
+          child: Text(main,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textDirection: TextDirection.ltr,
+              style: base.copyWith(
+                  fontWeight: FontWeight.bold,
+                  color: risky ? scheme.error : scheme.onSurface)),
+        ),
+        if (risky)
+          Padding(
+            padding: const EdgeInsets.only(left: 6),
+            child: Icon(Icons.gpp_maybe, size: 16, color: scheme.error),
+          ),
+      ]),
     );
   }
 }

@@ -25,7 +25,15 @@ const List<SearchEngine> searchEngines = <SearchEngine>[
       'https://www.ecosia.org/search?q=%s'),
 ];
 
-enum TabErrorKind { none, offline, network, ssl, crashed, httpsUnavailable }
+enum TabErrorKind {
+  none,
+  offline,
+  network,
+  ssl,
+  crashed,
+  httpsUnavailable,
+  dangerous,
+}
 
 class BrowserTab {
   BrowserTab({
@@ -47,6 +55,13 @@ class BrowserTab {
   bool activated = false;
   double progress = 1;
   bool desktopMode = false;
+
+  /// JavaScript state of this tab's WebView (changes per site).
+  bool jsEnabled = true;
+
+  /// Times of recent automatic (no tap) cross-site navigations.
+  final List<DateTime> autoNavs = <DateTime>[];
+
   TabErrorKind error = TabErrorKind.none;
   String errorDetail = '';
   String? failedUrl;

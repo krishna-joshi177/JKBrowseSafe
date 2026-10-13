@@ -129,7 +129,7 @@ String fileNameFor(
       name = Uri.decodeComponent(name);
     } catch (_) {}
   }
-  name = name.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
+  name = name!.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
   if (name.isEmpty || name == '.' || name == '..') name = 'download';
   if (!name.contains('.') && mime != null) {
     final ext = _mimeExt[mime.split(';').first.trim().toLowerCase()];

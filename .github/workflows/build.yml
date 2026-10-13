@@ -23,7 +23,9 @@ jobs:
         with:
           channel: stable
       - name: Create platform folders
-        run: flutter create --platforms=android --org com.safebrowse --project-name safe_browser .
+        run: |
+          flutter create --platforms=android --org com.safebrowse --project-name safe_browser .
+          rm -f test/widget_test.dart
       - run: flutter pub get
       - name: Check code
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
@@ -48,9 +50,6 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -64,13 +63,14 @@ jobs:
           sed -i '/^project(/a add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)' windows/CMakeLists.txt
           sed -i 's/L"safe_browser"/L"JKBrowseSafe"/' windows/runner/main.cpp
       - name: Build Windows app
+        shell: pwsh
         env:
           CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: >
           flutter build windows --release
-          --build-name=$APP_VERSION
-          --build-number=$BUILD_NUMBER
-          --dart-define=APP_VERSION=$APP_VERSION
+          --build-name=${{ env.APP_VERSION }}
+          --build-number=${{ env.BUILD_NUMBER }}
+          --dart-define=APP_VERSION=${{ env.APP_VERSION }}
       - uses: actions/upload-artifact@v4
         with:
           name: JKBrowseSafe-Windows-${{ env.APP_VERSION }}

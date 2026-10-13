@@ -1,9 +1,14 @@
-name: Build SafeBrowse
+name: Build JKBrowseSafe
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
+env:
+  # Automatic versioning: every GitHub build gets a new version number.
+  APP_VERSION: 1.1.${{ github.run_number }}
+  BUILD_NUMBER: ${{ github.run_number }}
 
 jobs:
   android:
@@ -18,45 +23,55 @@ jobs:
         with:
           channel: stable
       - name: Create platform folders
-        run: flutter create --platforms=android --org com.safebrowse .
+        run: flutter create --platforms=android --org com.safebrowse --project-name safe_browser .
       - run: flutter pub get
-      - name: Add INTERNET permission
+      - name: Check code
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Run tests
+        run: flutter test
+      - name: Patch Android manifest
+        run: python3 tool/patch_android.py
+      - name: Patch old ProGuard setting in plugins
         run: |
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <application|' android/app/src/main/AndroidManifest.xml
-          grep -n "permission" android/app/src/main/AndroidManifest.xml
-      - name: Patch inappwebview ProGuard setting
-        run: |
-          for f in $HOME/.pub-cache/hosted/pub.dev/flutter_inappwebview_android-*/android/build.gradle; do
-            sed -i "s/proguard-android.txt/proguard-android-optimize.txt/g" "$f"
-            echo "Patched $f"
-          done
+          grep -rl --include=build.gradle --include=build.gradle.kts "proguard-android.txt" "$HOME/.pub-cache/hosted/pub.dev/" \
+            | xargs -r sed -i "s/proguard-android.txt/proguard-android-optimize.txt/g"
       - name: Build APK
-        run: flutter build apk --release
+        run: >
+          flutter build apk --release
+          --build-name=$APP_VERSION
+          --build-number=$BUILD_NUMBER
+          --dart-define=APP_VERSION=$APP_VERSION
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeBrowse-Android-APK
+          name: JKBrowseSafe-Android-${{ env.APP_VERSION }}
           path: build/app/outputs/flutter-apk/app-release.apk
 
   windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
       - name: Create platform folders
-        run: flutter create --platforms=windows --org com.safebrowse .
+        run: flutter create --platforms=windows --org com.safebrowse --project-name safe_browser .
       - run: flutter pub get
-      - name: Silence coroutine deprecation error
-        shell: bash
+      - name: Patch Windows project
         run: |
           sed -i '/^project(/a add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)' windows/CMakeLists.txt
-          grep -n "SILENCE" windows/CMakeLists.txt
+          sed -i 's/L"safe_browser"/L"JKBrowseSafe"/' windows/runner/main.cpp
       - name: Build Windows app
         env:
           CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
-        run: flutter build windows --release
+        run: >
+          flutter build windows --release
+          --build-name=$APP_VERSION
+          --build-number=$BUILD_NUMBER
+          --dart-define=APP_VERSION=$APP_VERSION
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeBrowse-Windows
+          name: JKBrowseSafe-Windows-${{ env.APP_VERSION }}
           path: build/windows/x64/runner/Release/

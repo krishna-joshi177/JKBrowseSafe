@@ -106,35 +106,41 @@ const Map<String, String> _mimeExt = <String, String>{
   'application/vnd.android.package-archive': 'apk',
 };
 
+String _safeDecode(String s) {
+  try {
+    return Uri.decodeComponent(s);
+  } catch (_) {
+    return s;
+  }
+}
+
 /// Picks a safe file name for a download.
 String fileNameFor(
     String url, String? suggested, String? contentDisposition, String? mime) {
-  String? name = suggested;
-  if ((name == null || name.isEmpty) && contentDisposition != null) {
+  String raw = suggested ?? '';
+
+  if (raw.isEmpty && contentDisposition != null) {
     final m = RegExp(r'''filename\*?=(?:UTF-8'')?["']?([^"';]+)''',
             caseSensitive: false)
         .firstMatch(contentDisposition);
-    if (m != null) {
-      try {
-        name = Uri.decodeComponent(m.group(1)!.trim());
-      } catch (_) {
-        name = m.group(1)!.trim();
-      }
-    }
+    final g = m?.group(1);
+    if (g != null) raw = _safeDecode(g.trim());
   }
-  if (name == null || name.isEmpty) {
-    final segs = Uri.tryParse(url)?.pathSegments ?? <String>[];
-    name = segs.isNotEmpty && segs.last.isNotEmpty ? segs.last : 'download';
-    try {
-      name = Uri.decodeComponent(name);
-    } catch (_) {}
+
+  if (raw.isEmpty) {
+    final segs = Uri.tryParse(url)?.pathSegments ?? const <String>[];
+    final last = segs.isNotEmpty ? segs.last : '';
+    raw = last.isNotEmpty ? _safeDecode(last) : 'download';
   }
-  name = name!.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
+
+  String name = raw.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
   if (name.isEmpty || name == '.' || name == '..') name = 'download';
+
   if (!name.contains('.') && mime != null) {
     final ext = _mimeExt[mime.split(';').first.trim().toLowerCase()];
     if (ext != null) name = '$name.$ext';
   }
+
   if (name.length > 120) {
     final dot = name.lastIndexOf('.');
     final ext = dot > 0 && name.length - dot <= 10 ? name.substring(dot) : '';

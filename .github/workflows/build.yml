@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Automatic versioning: every GitHub build gets a new version number.
   APP_VERSION: 1.1.${{ github.run_number }}
   BUILD_NUMBER: ${{ github.run_number }}
 
@@ -40,9 +39,9 @@ jobs:
       - name: Build APK
         run: >
           flutter build apk --release
-          --build-name=$APP_VERSION
-          --build-number=$BUILD_NUMBER
-          --dart-define=APP_VERSION=$APP_VERSION
+          --build-name=${{ env.APP_VERSION }}
+          --build-number=${{ env.BUILD_NUMBER }}
+          --dart-define=APP_VERSION=${{ env.APP_VERSION }}
       - uses: actions/upload-artifact@v4
         with:
           name: JKBrowseSafe-Android-${{ env.APP_VERSION }}
@@ -56,9 +55,12 @@ jobs:
         with:
           channel: stable
       - name: Create platform folders
-        run: flutter create --platforms=windows --org com.safebrowse --project-name safe_browser .
+        run: |
+          flutter create --platforms=windows --org com.safebrowse --project-name safe_browser .
+          Remove-Item -Force -ErrorAction SilentlyContinue test/widget_test.dart
       - run: flutter pub get
       - name: Patch Windows project
+        shell: bash
         run: |
           sed -i '/^project(/a add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)' windows/CMakeLists.txt
           sed -i 's/L"safe_browser"/L"JKBrowseSafe"/' windows/runner/main.cpp
@@ -66,11 +68,7 @@ jobs:
         shell: pwsh
         env:
           CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
-        run: >
-          flutter build windows --release
-          --build-name=${{ env.APP_VERSION }}
-          --build-number=${{ env.BUILD_NUMBER }}
-          --dart-define=APP_VERSION=${{ env.APP_VERSION }}
+        run: flutter build windows --release --build-name=${{ env.APP_VERSION }} --build-number=${{ env.BUILD_NUMBER }} --dart-define=APP_VERSION=${{ env.APP_VERSION }}
       - uses: actions/upload-artifact@v4
         with:
           name: JKBrowseSafe-Windows-${{ env.APP_VERSION }}
